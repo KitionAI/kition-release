@@ -1,0 +1,201 @@
+name: Package Release
+
+on:
+  push:
+    tags:
+      - "**"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to create or update, for example v1.0.0"
+        required: true
+        type: string
+      source_ref:
+        description: "Kition source ref to build. Defaults to main."
+        required: false
+        type: string
+      release_channel:
+        description: "Desktop release channel"
+        required: true
+        default: "prod"
+        type: choice
+        options:
+          - prod
+          - test
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  SOURCE_REPOSITORY: KitionAI/kition
+  PNPM_VERSION: 10.33.0
+  NODE_VERSION: "20"
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  SOURCE_REF: ${{ github.event_name == 'workflow_dispatch' && (inputs.source_ref || 'main') || 'main' }}
+  RELEASE_CHANNEL: ${{ github.event_name == 'workflow_dispatch' && inputs.release_channel || 'prod' }}
+
+jobs:
+  create-release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "Release $RELEASE_TAG already exists"
+            exit 0
+          fi
+
+          args=(create "$RELEASE_TAG" --title "$RELEASE_TAG" --generate-notes)
+          if git check-ref-format --allow-onelevel "$RELEASE_TAG" >/dev/null 2>&1; then
+            args+=(--target "$GITHUB_SHA")
+          fi
+          if [[ "$RELEASE_TAG" == *-* ]]; then
+            args+=(--prerelease)
+          fi
+
+          gh release "${args[@]}"
+
+  package-desktop:
+    name: Package Desktop (${{ matrix.label }})
+    needs: create-release
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14
+            label: macos-arm64
+          - runner: windows-2022
+            label: windows-x64
+    steps:
+      - name: Checkout Kition source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPOSITORY }}
+          ref: ${{ env.SOURCE_REF }}
+          path: kition
+          fetch-depth: 1
+          token: ${{ secrets.KITION_SOURCE_REPO_TOKEN || github.token }}
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+          cache-dependency-path: kition/ui/pnpm-lock.yaml
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: kition/api/go.mod
+          cache-dependency-path: kition/api/go.sum
+
+      - name: Install frontend dependencies
+        working-directory: kition/ui
+        env:
+          ELECTRON_MIRROR: https://npmmirror.com/mirrors/electron/
+        run: pnpm install --frozen-lockfile --prefer-offline
+
+      - name: Prepare macOS signing entitlements
+        if: runner.os == 'macOS'
+        working-directory: kition/ui
+        run: |
+          set -euo pipefail
+          if [[ ! -f build/entitlements.mac.plist ]]; then
+            mkdir -p build
+            cat > build/entitlements.mac.plist <<'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>com.apple.security.cs.allow-jit</key>
+            <true/>
+            <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+            <true/>
+            <key>com.apple.security.cs.disable-library-validation</key>
+            <true/>
+          </dict>
+          </plist>
+          EOF
+          fi
+          plutil -lint build/entitlements.mac.plist
+
+      - name: Build macOS Electron release files
+        if: runner.os == 'macOS'
+        working-directory: kition/ui
+        env:
+          KITION_RELEASE_CHANNEL: ${{ env.RELEASE_CHANNEL }}
+          KITION_CSC_KEY_PASSWORD: ${{ secrets.KITION_CSC_KEY_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          ELECTRON_MIRROR: https://npmmirror.com/mirrors/electron/
+        run: |
+          set -euo pipefail
+          if [[ -z "${APPLE_ID:-}" || -z "${APPLE_APP_SPECIFIC_PASSWORD:-}" || -z "${APPLE_TEAM_ID:-}" ]]; then
+            echo "APPLE_ID, APPLE_APP_SPECIFIC_PASSWORD, and APPLE_TEAM_ID secrets are required for macOS notarization"
+            exit 1
+          fi
+          ENTITLEMENTS_PATH="$PWD/build/entitlements.mac.plist"
+          node electron/scripts/build-electron.mjs \
+            --config.mac.entitlements="$ENTITLEMENTS_PATH" \
+            --config.mac.entitlementsInherit="$ENTITLEMENTS_PATH" \
+            --config.mac.notarize.teamId="$APPLE_TEAM_ID" \
+            --publish never
+
+      - name: Build Windows Electron release files
+        if: runner.os == 'Windows'
+        working-directory: kition/ui
+        env:
+          KITION_RELEASE_CHANNEL: ${{ env.RELEASE_CHANNEL }}
+          ELECTRON_MIRROR: https://npmmirror.com/mirrors/electron/
+        run: pnpm run dist:electron
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-files-${{ matrix.label }}
+          path: kition/ui/dist-electron/*
+          if-no-files-found: error
+
+      - name: Upload files to GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          release_files=()
+          while IFS= read -r release_file; do
+            release_files+=("$release_file")
+          done < <(
+            find kition/ui/dist-electron -maxdepth 1 -type f \( \
+              -name "*.dmg" -o \
+              -name "*.exe" -o \
+              -name "*.blockmap" -o \
+              -name "latest*.yml" -o \
+              -name "*.zip" \
+            \) -print
+          )
+          if (( ${#release_files[@]} == 0 )); then
+            echo "No release files found in kition/ui/dist-electron"
+            exit 1
+          fi
+          gh release upload "$RELEASE_TAG" "${release_files[@]}" --clobber
