@@ -153,10 +153,7 @@ jobs:
             echo "APPLE_ID, APPLE_APP_SPECIFIC_PASSWORD, and APPLE_TEAM_ID secrets are required for macOS notarization"
             exit 1
           fi
-          ENTITLEMENTS_PATH="$PWD/build/entitlements.mac.plist"
           node electron/scripts/build-electron.mjs \
-            --config.mac.entitlements="$ENTITLEMENTS_PATH" \
-            --config.mac.entitlementsInherit="$ENTITLEMENTS_PATH" \
             --config.mac.notarize.teamId="$APPLE_TEAM_ID" \
             --publish never
 
