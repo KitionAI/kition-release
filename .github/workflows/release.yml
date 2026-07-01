@@ -79,6 +79,8 @@ jobs:
             label: macos-arm64
           - runner: windows-2022
             label: windows-x64
+          - runner: ubuntu-latest
+            label: linux-x64
     steps:
       - name: Checkout Kition source
         uses: actions/checkout@v4
@@ -171,6 +173,14 @@ jobs:
           ELECTRON_MIRROR: https://npmmirror.com/mirrors/electron/
         run: pnpm run dist:electron
 
+      - name: Build Linux Electron release files
+        if: runner.os == 'Linux'
+        working-directory: kition/ui
+        env:
+          KITION_RELEASE_CHANNEL: ${{ env.RELEASE_CHANNEL }}
+          ELECTRON_MIRROR: https://npmmirror.com/mirrors/electron/
+        run: pnpm run dist:electron
+
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
         with:
@@ -192,6 +202,7 @@ jobs:
             find kition/ui/dist-electron -maxdepth 1 -type f \( \
               -name "*.dmg" -o \
               -name "*.exe" -o \
+              -name "*.AppImage" -o \
               -name "*.blockmap" -o \
               -name "latest*.yml" -o \
               -name "*.zip" \
